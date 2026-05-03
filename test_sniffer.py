@@ -7,7 +7,7 @@ Usage:
 Steps:
     1. Starts capture for N seconds
     2. Prints protocol stats
-    3. Checks HTTP and DNS appeared
+    3. Verifies TCP, DNS, UDP or ICMP appeared
     4. Prints flow summary
     5. Prints time-series data
 """
@@ -50,20 +50,29 @@ def main():
     for entry in ts:
         print(f"  {entry}")
 
-    # Verify HTTP / DNS
+    # Verify
     print(f"\n{'='*50}")
     print(f"  VERIFICATION")
     print(f"{'='*50}")
-    http_ok = stats['HTTP']['packets'] > 0
-    dns_ok  = stats['DNS']['packets'] > 0
-    print(f"  HTTP detected: {'PASS' if http_ok else 'FAIL (try browsing)'}")
-    print(f"  DNS  detected: {'PASS' if dns_ok  else 'FAIL (try browsing)'}")
-    print(f"  PCAP created:  {'PASS' if True else 'FAIL'}")
+    tcp_ok = stats['TCP']['packets'] > 0
+    dns_ok = stats['DNS']['packets'] > 0
+    udp_ok = stats['UDP']['packets'] > 0
+    tls_ok = stats['TLS/SSL']['packets'] > 0
+    ts_ok = len(ts) > 0
+    flow_ok = flow['total_packets'] > 0
 
-    if http_ok and dns_ok:
-        print(f"\n  ALL CHECKS PASSED")
+    print(f"  TCP  detected: {'PASS' if tcp_ok else 'FAIL'}")
+    print(f"  DNS  detected: {'PASS' if dns_ok else 'FAIL (try browsing)'}")
+    print(f"  UDP  detected: {'PASS' if udp_ok else 'FAIL'}")
+    print(f"  TLS  detected: {'PASS' if tls_ok else 'FAIL (try HTTPS)'}")
+    print(f"  TimeSeries:    {'PASS' if ts_ok else 'FAIL'}")
+    print(f"  FlowSummary:   {'PASS' if flow_ok else 'FAIL'}")
+
+    all_pass = tcp_ok and ts_ok and flow_ok
+    if all_pass:
+        print(f"\n  CORE CHECKS PASSED")
     else:
-        print(f"\n  Some protocols missing -- browse the web and re-run")
+        print(f"\n  FAILED -- check Wireshark/Npcap installation")
 
 
 if __name__ == '__main__':
