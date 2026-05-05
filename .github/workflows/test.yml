@@ -1,0 +1,50 @@
+name: ThreatSight CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tshark
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Verify tools
+        run: |
+          python --version
+          tshark --version | head -1
+          python -c "import pyshark; print('pyshark OK')"
+          python -c "import sklearn; print('sklearn OK')"
+
+      - name: Ensure samples directory exists
+        run: mkdir -p samples
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
+        env:
+          PYTHONPATH: "."
