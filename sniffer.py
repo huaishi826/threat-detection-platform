@@ -137,6 +137,133 @@ class TrafficSniffer:
             return None
 
     @staticmethod
+    def analyze_pcap(pcap_filename, window_sec=5, model_path=None):
+        """Single-pass pcap analysis — returns stats, flow, timeseries, and alerts.
+
+        Much faster than calling get_protocol_stats + get_flow_summary +
+        get_protocol_timeseries separately (avoids 3 tshark spawns).
+        """
+        proto_stats = {
+            'HTTP':    {'packets': 0, 'bytes': 0},
+            'DNS':     {'packets': 0, 'bytes': 0},
+            'TCP':     {'packets': 0, 'bytes': 0},
+            'UDP':     {'packets': 0, 'bytes': 0},
+            'ICMP':    {'packets': 0, 'bytes': 0},
+            'TLS/SSL': {'packets': 0, 'bytes': 0},
+            'ARP':     {'packets': 0, 'bytes': 0},
+        }
+        total_packets = 0
+        total_bytes = 0
+        first_ts = None
+        last_ts = None
+        timeseries = {}
+        epoch0 = None
+
+        try:
+            import asyncio
+            try:
+                asyncio.get_event_loop()
+            except RuntimeError:
+                asyncio.set_event_loop(asyncio.new_event_loop())
+
+            cap = pyshark.FileCapture(
+                pcap_filename,
+                tshark_path=r"C:\Program Files\Wireshark\tshark.exe",
+            )
+            for pkt in cap:
+                total_packets += 1
+                pkt_size = int(pkt.length)
+                total_bytes += pkt_size
+                proto_names = {p.layer_name.upper() for p in pkt.layers}
+
+                # Per-protocol stats
+                if 'HTTP' in proto_names:
+                    proto_stats['HTTP']['packets'] += 1
+                    proto_stats['HTTP']['bytes'] += pkt_size
+                if 'DNS' in proto_names:
+                    proto_stats['DNS']['packets'] += 1
+                    proto_stats['DNS']['bytes'] += pkt_size
+                if 'TCP' in proto_names:
+                    proto_stats['TCP']['packets'] += 1
+                    proto_stats['TCP']['bytes'] += pkt_size
+                if 'UDP' in proto_names:
+                    proto_stats['UDP']['packets'] += 1
+                    proto_stats['UDP']['bytes'] += pkt_size
+                if 'ICMPV6' in proto_names or 'ICMP' in proto_names:
+                    proto_stats['ICMP']['packets'] += 1
+                    proto_stats['ICMP']['bytes'] += pkt_size
+                if 'TLS' in proto_names or 'SSL' in proto_names:
+                    proto_stats['TLS/SSL']['packets'] += 1
+                    proto_stats['TLS/SSL']['bytes'] += pkt_size
+                if 'ARP' in proto_names:
+                    proto_stats['ARP']['packets'] += 1
+                    proto_stats['ARP']['bytes'] += pkt_size
+
+                # Timestamps
+                ts = TrafficSniffer._get_sniff_time(pkt)
+                if ts is not None:
+                    try:
+                        if isinstance(ts, datetime.datetime):
+                            ts_epoch = ts.timestamp()
+                        else:
+                            ts_epoch = float(ts)
+                        if first_ts is None:
+                            first_ts = ts_epoch
+                        last_ts = ts_epoch
+                        rel = ts_epoch - (epoch0 if epoch0 else ts_epoch)
+                        if epoch0 is None:
+                            epoch0 = ts_epoch
+                            rel = 0
+                        bucket = int(rel // window_sec) * window_sec
+                        if bucket not in timeseries:
+                            timeseries[bucket] = {
+                                'time': datetime.timedelta(seconds=bucket + window_sec),
+                                'HTTP': 0, 'DNS': 0, 'TCP': 0, 'UDP': 0, 'ICMP': 0,
+                            }
+                        if 'HTTP' in proto_names:
+                            timeseries[bucket]['HTTP'] += 1
+                        if 'DNS' in proto_names:
+                            timeseries[bucket]['DNS'] += 1
+                        if 'TCP' in proto_names:
+                            timeseries[bucket]['TCP'] += 1
+                        if 'UDP' in proto_names:
+                            timeseries[bucket]['UDP'] += 1
+                        if 'ICMPV6' in proto_names or 'ICMP' in proto_names:
+                            timeseries[bucket]['ICMP'] += 1
+                    except (ValueError, TypeError):
+                        pass
+            cap.close()
+        except Exception as exc:
+            print(f"[!] Single-pass analysis error: {exc}")
+
+        # Compute duration
+        duration = 0.0
+        if first_ts and last_ts:
+            duration = round(abs(last_ts - first_ts), 2)
+        avg_size = round(total_bytes / total_packets, 1) if total_packets > 0 else 0.0
+
+        # Format timeseries
+        ts_result = []
+        for key in sorted(timeseries):
+            entry = timeseries[key]
+            entry['time'] = str(entry['time'])
+            ts_result.append(entry)
+
+        # Per-protocol counts for pie chart
+        proto_counts = {p: d['packets'] for p, d in proto_stats.items() if d['packets'] > 0}
+
+        return {
+            'stats': proto_counts,
+            'summary': {
+                'total_packets': total_packets,
+                'total_bytes': total_bytes,
+                'duration_sec': duration,
+                'avg_packet_size': avg_size,
+            },
+            'time_series': ts_result,
+        }
+
+    @staticmethod
     def get_protocol_stats(pcap_filename):
         """Read a pcap file and count packets + bytes per protocol."""
         stats = {

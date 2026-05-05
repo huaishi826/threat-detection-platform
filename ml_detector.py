@@ -9,10 +9,23 @@ Pipeline:
 Dependencies: numpy, scikit-learn, joblib
 """
 
+import json
+import os
 import numpy as np
 from sklearn.ensemble import IsolationForest
 import joblib
 from pathlib import Path
+
+
+def _load_ml_config():
+    """Read ml.contamination from config.json."""
+    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg.get("ml", {}).get("contamination", 0.1)
+    except Exception:
+        return 0.1
 
 
 class MLAnomalyDetector:
@@ -30,13 +43,15 @@ class MLAnomalyDetector:
             timestamps, is_anom, scores, feature_matrix, feature_names)
     """
 
-    def __init__(self, contamination=0.1, random_state=42, n_estimators=200):
+    def __init__(self, contamination=None, random_state=42, n_estimators=200):
         """
         Args:
-            contamination: Expected fraction of anomalies in training data.
+            contamination: Expected fraction of anomalies (default from config).
             random_state:  Reproducibility seed.
             n_estimators:  Number of isolation trees.
         """
+        if contamination is None:
+            contamination = _load_ml_config()
         self.contamination = contamination
         self.random_state = random_state
         self.n_estimators = n_estimators

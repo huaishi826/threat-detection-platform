@@ -16,6 +16,7 @@ import {
 } from 'echarts/components'
 
 import App from './App.vue'
+import router from './router'
 
 use([
   CanvasRenderer,
@@ -35,4 +36,5 @@ for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
 }
 app.component('v-chart', VChart)
 app.use(ElementPlus)
+app.use(router)
 app.mount('#app')

@@ -10,8 +10,34 @@ Each detector returns a list of alert dicts with keys:
   timestamp, type, severity, source_ip, detail
 """
 
+import json
+import os
 import datetime
 from collections import defaultdict
+
+
+# ─── config loader ───────────────────────────────────────────────────
+
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+
+def load_rules_config():
+    """Read detection thresholds from config.json."""
+    try:
+        with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return {
+            "syn_flood": cfg.get("syn_flood", {}),
+            "dns_tunnel": cfg.get("dns_tunnel", {}),
+            "port_scan": cfg.get("port_scan", {}),
+        }
+    except Exception:
+        # fallback defaults if config.json is missing
+        return {
+            "syn_flood": {"window": 10, "threshold": 0.7, "min_packets": 100},
+            "dns_tunnel": {"window": 60, "query_threshold": 50, "length_threshold": 40},
+            "port_scan": {"window": 30, "port_threshold": 20},
+        }
 
 import pyshark
 
@@ -65,7 +91,7 @@ def _tcp_flag_set(pkt, flag):
 
 # ─── detector 1: SYN Flood ──────────────────────────────────────────
 
-def detect_syn_flood(pcap_file, window=10, threshold=0.7, min_packets=100):
+def detect_syn_flood(pcap_file, window=None, threshold=None, min_packets=None):
     """Detect SYN flood attacks.
 
     A SYN flood sends massive TCP SYN packets without completing the
@@ -73,13 +99,21 @@ def detect_syn_flood(pcap_file, window=10, threshold=0.7, min_packets=100):
 
     Args:
         pcap_file:   Path to .pcap file.
-        window:      Time window size in seconds.
-        threshold:   SYN ratio threshold (0-1).  If SYN/TCP > this, alert.
-        min_packets: Minimum TCP packets in window to consider.
+        window:      Time window size in seconds (default from config).
+        threshold:   SYN ratio threshold (0-1) (default from config).
+        min_packets: Minimum TCP packets in window (default from config).
 
     Returns:
         list[dict]  Alerts sorted by timestamp.
     """
+    cfg = load_rules_config()["syn_flood"]
+    if window is None:
+        window = cfg.get("window", 10)
+    if threshold is None:
+        threshold = cfg.get("threshold", 0.7)
+    if min_packets is None:
+        min_packets = cfg.get("min_packets", 100)
+
     alerts = []
     windows = defaultdict(lambda: {"syn": 0, "tcp": 0, "first_ts": None})
 
@@ -125,8 +159,8 @@ def detect_syn_flood(pcap_file, window=10, threshold=0.7, min_packets=100):
 
 # ─── detector 2: DNS Tunnel ─────────────────────────────────────────
 
-def detect_dns_tunnel(pcap_file, window=60, query_threshold=50,
-                      length_threshold=40):
+def detect_dns_tunnel(pcap_file, window=None, query_threshold=None,
+                      length_threshold=None):
     """Detect DNS tunnelling.
 
     DNS tunnelling encodes data in long, high-frequency DNS queries.
@@ -135,13 +169,21 @@ def detect_dns_tunnel(pcap_file, window=60, query_threshold=50,
 
     Args:
         pcap_file:         Path to .pcap file.
-        window:            Time window in seconds.
-        query_threshold:   Max queries per domain in window before alerting.
-        length_threshold:  Max average query-name length before alerting.
+        window:            Time window in seconds (default from config).
+        query_threshold:   Max queries per domain in window (default from config).
+        length_threshold:  Max average query-name length (default from config).
 
     Returns:
         list[dict]  Alerts sorted by timestamp.
     """
+    cfg = load_rules_config()["dns_tunnel"]
+    if window is None:
+        window = cfg.get("window", 60)
+    if query_threshold is None:
+        query_threshold = cfg.get("query_threshold", 50)
+    if length_threshold is None:
+        length_threshold = cfg.get("length_threshold", 40)
+
     alerts = []
     dns_data = defaultdict(lambda: defaultdict(
         lambda: {"count": 0, "total_len": 0, "first_ts": None}))
@@ -191,7 +233,7 @@ def detect_dns_tunnel(pcap_file, window=60, query_threshold=50,
 
 # ─── detector 3: Port Scan ──────────────────────────────────────────
 
-def detect_port_scan(pcap_file, window=30, port_threshold=20):
+def detect_port_scan(pcap_file, window=None, port_threshold=None):
     """Detect horizontal port scans.
 
     A port scan probes many different ports on one or more hosts.
@@ -200,12 +242,18 @@ def detect_port_scan(pcap_file, window=30, port_threshold=20):
 
     Args:
         pcap_file:      Path to .pcap file.
-        window:         Time window in seconds.
-        port_threshold: Max unique ports before alerting.
+        window:         Time window in seconds (default from config).
+        port_threshold: Max unique ports before alerting (default from config).
 
     Returns:
         list[dict]  Alerts sorted by timestamp.
     """
+    cfg = load_rules_config()["port_scan"]
+    if window is None:
+        window = cfg.get("window", 30)
+    if port_threshold is None:
+        port_threshold = cfg.get("port_threshold", 20)
+
     alerts = []
     scan_data = defaultdict(lambda: defaultdict(
         lambda: {"ports": set(), "first_ts": None}))

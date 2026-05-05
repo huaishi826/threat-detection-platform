@@ -8,31 +8,32 @@ services:
     ports:
       - "5000:5000"
     environment:
-      - INFLUXDB_URL=http://influxdb:8086
-      - INFLUXDB_TOKEN=demo-token
-      - INFLUXDB_ORG=threat-detection
-      - INFLUXDB_BUCKET=traffic
+      - DEMO_MODE=${DEMO_MODE:-false}
+      - DB_PATH=/app/threatsight.db
     volumes:
-      - ./captures:/app/captures
+      - ./config.json:/app/config.json
+      - ./threatsight.db:/app/threatsight.db
+      - ./samples:/app/samples
       - ./results:/app/results
-      - ./model.pkl:/app/model.pkl
-    depends_on:
-      influxdb:
-        condition: service_healthy
+      - ./captures:/app/captures
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/"]
-      interval: 15s
-      timeout: 5s
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/health')"]
+      interval: 30s
+      timeout: 10s
       retries: 3
+      start_period: 40s
+    restart: unless-stopped
 
   frontend:
     build:
       context: .
       dockerfile: Dockerfile.frontend
     ports:
-      - "8080:80"
+      - "80:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
 
   influxdb:
     image: influxdb:2.7
@@ -41,17 +42,26 @@ services:
     environment:
       - DOCKER_INFLUXDB_INIT_MODE=setup
       - DOCKER_INFLUXDB_INIT_USERNAME=admin
-      - DOCKER_INFLUXDB_INIT_PASSWORD=admin123456
-      - DOCKER_INFLUXDB_INIT_ORG=threat-detection
+      - DOCKER_INFLUXDB_INIT_PASSWORD=admin123
+      - DOCKER_INFLUXDB_INIT_ORG=threatsight
       - DOCKER_INFLUXDB_INIT_BUCKET=traffic
-      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=demo-token
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=secret-token
     volumes:
-      - influxdb-data:/var/lib/influxdb2
-    healthcheck:
-      test: ["CMD", "influx", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      - influxdb_data:/var/lib/influxdb2
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - influxdb
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
 
 volumes:
-  influxdb-data:
+  influxdb_data:
+  grafana_data:
