@@ -1,4 +1,4 @@
-﻿"""Tests for rule_detector.py 鈥?rule-based threat detection."""
+﻿"""Tests for rule_detector.py — rule-based threat detection."""
 
 import sys
 import os
@@ -6,7 +6,6 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import rule_detector
-from rule_detector import load_rules_config
 
 
 class TestDetectSynFlood:
@@ -67,7 +66,6 @@ class TestDetectAll:
         alerts = rule_detector.detect_all(demo_pcap)
         assert isinstance(alerts, list)
         if len(alerts) > 1:
-            # verify sorted by timestamp
             for i in range(len(alerts) - 1):
                 assert alerts[i].get("timestamp", "") <= alerts[i + 1].get("timestamp", "")
 
@@ -83,7 +81,7 @@ class TestConfigLoader:
 
     def test_load_rules_config_returns_dict(self):
         """Config loader should return a dict with expected keys."""
-        cfg = load_rules_config()
+        cfg = rule_detector.load_rules_config()
         assert isinstance(cfg, dict)
         assert "syn_flood" in cfg
         assert "dns_tunnel" in cfg
@@ -91,18 +89,6 @@ class TestConfigLoader:
 
     def test_syn_flood_config_has_threshold(self):
         """SYN flood config should contain threshold key."""
-        cfg = load_rules_config()
+        cfg = rule_detector.load_rules_config()
         assert "threshold" in cfg["syn_flood"]
         assert 0 < cfg["syn_flood"]["threshold"] <= 1
-
-
-class TestDebugModule:
-    """Debug: inspect what's in the rule_detector module."""
-
-    def test_module_attributes(self):
-        """Print all public attributes of rule_detector module."""
-        attrs = [a for a in dir(rule_detector) if not a.startswith("_")]
-        print(f"rule_detector attrs: {attrs}")
-        assert "load_rules_config" in attrs, f"load_rules_config not found! Available: {attrs}"
-
-

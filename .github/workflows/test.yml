@@ -40,6 +40,11 @@ jobs:
           tshark --version | head -1
           python -c "import pyshark; print('pyshark OK')"
           python -c "import sklearn; print('sklearn OK')"
+          echo "--- DEBUG rule_detector ---"
+          head -30 rule_detector.py
+          echo "--- Check load_rules_config ---"
+          grep -n 'def load_rules_config' rule_detector.py
+          python -c "import rule_detector; print(dir(rule_detector))"
 
       - name: Ensure samples directory exists
         run: mkdir -p samples
