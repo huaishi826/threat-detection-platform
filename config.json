@@ -1,0 +1,26 @@
+{
+  "syn_flood": {
+    "window": 10,
+    "threshold": 0.7,
+    "min_packets": 100
+  },
+  "dns_tunnel": {
+    "window": 60,
+    "query_threshold": 50,
+    "length_threshold": 40
+  },
+  "port_scan": {
+    "window": 30,
+    "port_threshold": 20
+  },
+  "ml": {
+    "contamination": 0.1
+  },
+  "auto_block": {
+    "enabled": false
+  },
+  "notification": {
+    "email_enabled": false,
+    "email_to": ""
+  }
+}
