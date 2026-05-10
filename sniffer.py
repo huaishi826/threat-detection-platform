@@ -1,5 +1,48 @@
 import tempfile, os, datetime, subprocess, threading
+import logging
 import pyshark
+
+logger = logging.getLogger(__name__)
+
+# TShark path: env var > default
+_DEFAULT_TSHARK = os.environ.get("TSHARK_PATH", "tshark")
+
+# Protocol matching rules: (display_name, set_of_layer_names_to_match)
+_PROTOCOL_RULES = [
+    ('HTTP',    {'HTTP'}),
+    ('DNS',     {'DNS'}),
+    ('TCP',     {'TCP'}),
+    ('UDP',     {'UDP'}),
+    ('ICMP',    {'ICMP', 'ICMPV6'}),
+    ('TLS/SSL', {'TLS', 'SSL'}),
+    ('ARP',     {'ARP'}),
+]
+
+_TIMESERIES_PROTOS = ['HTTP', 'DNS', 'TCP', 'UDP', 'ICMP']
+_TIMESERIES_LAYER_MAP = {
+    'HTTP': {'HTTP'}, 'DNS': {'DNS'}, 'TCP': {'TCP'},
+    'UDP': {'UDP'}, 'ICMP': {'ICMP', 'ICMPV6'},
+}
+
+
+def _init_proto_stats():
+    """Create a zeroed protocol stats dict."""
+    return {name: {'packets': 0, 'bytes': 0} for name, _ in _PROTOCOL_RULES}
+
+
+def _count_protocols(proto_names, pkt_size, stats):
+    """Update protocol stats dict in-place based on layer names."""
+    for name, layers in _PROTOCOL_RULES:
+        if proto_names & layers:
+            stats[name]['packets'] += 1
+            stats[name]['bytes'] += pkt_size
+
+
+def _count_timeseries_proto(proto_names, bucket, timeseries):
+    """Update timeseries bucket counters in-place."""
+    for proto, layers in _TIMESERIES_LAYER_MAP.items():
+        if proto_names & layers:
+            timeseries[bucket][proto] += 1
 
 
 class TrafficSniffer:
@@ -16,52 +59,81 @@ class TrafficSniffer:
 
     PROTOCOLS = ['HTTP', 'DNS', 'TCP', 'UDP', 'ICMP', 'TLS', 'ARP']
 
-    def __init__(self, interface=None, timeout=60):
+    def __init__(self, interface=None, timeout=60, tshark_path=None):
         self.interface = interface
         self.timeout = timeout
         self._capture = None
         self._stop_event = threading.Event()
-        self._tshark = r"C:\Program Files\Wireshark\tshark.exe"
+        self._tshark = tshark_path or _DEFAULT_TSHARK
 
     def _auto_interface(self):
-        """Return best available NPF interface via tshark -D.
+        """Return best available network interface via tshark -D.
 
-        Preference order: WLAN / Wi-Fi / Ethernet / 以太网 first,
-        then first non-loopback as fallback.
+        Cross-platform: Windows (\\Device\\NPF_xxx) and Linux (eth0/wlan0).
         """
         try:
             result = subprocess.run(
                 [self._tshark, "-D"],
                 capture_output=True, text=False, timeout=10,
             )
-            raw = result.stdout.decode("gbk", errors="replace")
-            preferred = ["WLAN", "Wi-Fi", "Ethernet", "以太网", "VMnet1"]
-            best = None
-            fallback = None
-            fallback_name = ""
+            # Try UTF-8 (Linux) then GBK (Windows)
+            raw = None
+            for enc in ("utf-8", "gbk"):
+                try:
+                    raw = result.stdout.decode(enc, errors="replace")
+                    if raw.strip():
+                        break
+                except Exception:
+                    continue
+            if not raw or not raw.strip():
+                raw = result.stdout.decode("utf-8", errors="replace")
+
+            is_windows = os.name == "nt"
+            preferred_win = ["WLAN", "Wi-Fi", "\u4ee5\u592a\u7f51", "Ethernet"]
+            # In Docker, 'any' interface captures traffic across all virtual interfaces
+            # Don't prefer eth0/wlan0 etc. individually - 'any' covers them all
+            preferred_linux = ["any"]
+
+            candidates = []  # (name, is_preferred)
             for line in raw.splitlines():
                 line = line.strip()
-                if "\\Device\\NPF_" not in line:
+                if not line:
                     continue
-                if "Loopback" in line or "etwdump" in line:
-                    continue
-                start = line.index("\\Device\\NPF_")
-                end = line.index(" ", start) if " " in line[start:] else len(line)
-                path = line[start:end]
-                adapter = line[end:].strip(" ()")
-                for kw in preferred:
-                    if kw.lower() in adapter.lower():
-                        print(f"    Auto-selected preferred: {path} ({adapter})")
-                        return path
-                if fallback is None:
-                    fallback = path
-                    fallback_name = adapter
-            if fallback:
-                print(f"    Auto-selected fallback: {fallback} ({fallback_name})")
-                return fallback
+                if is_windows:
+                    if "\\Device\\NPF_" not in line:
+                        continue
+                    if "Loopback" in line or "etwdump" in line:
+                        continue
+                    start = line.index("\\Device\\NPF_")
+                    end = line.index(" ", start) if " " in line[start:] else len(line)
+                    iface = line[start:end]
+                    adapter = line[end:].strip(" ()")
+                    is_pref = any(kw.lower() in adapter.lower() for kw in preferred_win)
+                    candidates.append((iface, is_pref, adapter))
+                else:
+                    # Linux: "1. eth0" or "2. any"
+                    parts = line.split(".", 1)
+                    if len(parts) < 2:
+                        continue
+                    iface = parts[1].strip().split()[0]
+                    if iface in ("lo", "bluetooth-monitor", "nflog", "nfqueue"):
+                        continue
+                    is_pref = any(iface.startswith(kw) for kw in preferred_linux)
+                    candidates.append((iface, is_pref, iface))
+
+            if not candidates:
+                return "lo" if not is_windows else "\\Device\\NPF_Loopback"
+
+            # Prefer first preferred candidate, then first non-loopback
+            for name, is_pref, adapter in candidates:
+                if is_pref:
+                    print(f"    Auto-selected preferred: {name}")
+                    return name
+            print(f"    Auto-selected fallback: {candidates[0][0]}")
+            return candidates[0][0]
         except Exception as exc:
             print(f"    Interface detection failed: {exc}")
-        return "\\Device\\NPF_Loopback"
+        return "lo" if os.name != "nt" else "\\Device\\NPF_Loopback"
 
     def start_capture(self, pcap_filename):
         """Start live capture on background thread.
@@ -75,42 +147,99 @@ class TrafficSniffer:
         print(f"    Output: {pcap_filename}")
 
         self._stop_event.clear()
+        # Capture thread result (None=not done, str=error message, True=success)
+        self._capture_result = [None]
+
+        def _traffic_generator():
+            """Generate minimal background traffic to ensure capture has packets."""
+            import socket
+            while not self._stop_event.is_set():
+                try:
+                    # DNS lookup
+                    socket.setdefaulttimeout(2)
+                    socket.getaddrinfo("dns.alidns.com", 53)
+                except Exception:
+                    pass
+                try:
+                    # HTTP request
+                    import urllib.request
+                    urllib.request.urlopen("http://localhost:5000/api/health", timeout=2)
+                except Exception:
+                    pass
+                self._stop_event.wait(timeout=3)
 
         def _run():
-            import asyncio
             try:
-                asyncio.set_event_loop(asyncio.new_event_loop())
-            except Exception:
-                pass
-            try:
-                self._capture = pyshark.LiveCapture(
-                    interface=iface,
-                    output_file=pcap_filename,
-                    tshark_path=self._tshark,
+                cmd = [self._tshark, "-i", iface, "-w", pcap_filename,
+                       "-a", "duration:" + str(self.timeout)]
+                self._capture = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                 )
-                for pkt in self._capture.sniff_continuously():
-                    if self._stop_event.is_set():
+                # Start background traffic generator
+                _traffic_thread = threading.Thread(target=_traffic_generator, daemon=True)
+                _traffic_thread.start()
+                # Wait for process to finish or stop event
+                while self._capture.poll() is None:
+                    if self._stop_event.wait(timeout=0.5):
+                        self._capture.terminate()
                         break
+                try:
+                    self._capture.wait(timeout=5)
+                except Exception:
+                    self._capture.kill()
+                # Read stderr for error messages
+                err_raw = b""
+                try:
+                    _, err_raw = self._capture.communicate(timeout=3)
+                except Exception:
+                    pass
+                err_msg = ""
+                if err_raw:
+                    for enc in ("utf-8", "gbk"):
+                        try:
+                            err_msg = err_raw.decode(enc, errors="replace")
+                            break
+                        except Exception:
+                            continue
+                # Check pcap file size to determine success
+                pcap_ok = os.path.exists(pcap_filename) and os.path.getsize(pcap_filename) > 356
+                if pcap_ok:
+                    self._capture_result[0] = True
+                elif err_msg and "Permission denied" in err_msg:
+                    self._capture_result[0] = "Permission denied. Please run as Administrator."
+                elif err_msg:
+                    self._capture_result[0] = "Capture error: " + err_msg.strip()[:200]
+                else:
+                    self._capture_result[0] = True  # Empty but no error (no traffic)
             except PermissionError:
-                print("[!] Permission denied. Run as Administrator.")
+                self._capture_result[0] = "Permission denied. Please run as Administrator."
             except Exception as exc:
                 if not self._stop_event.is_set():
-                    print(f"[!] Capture error: {exc}")
+                    self._capture_result[0] = str(exc)[:200]
+                else:
+                    self._capture_result[0] = True
             finally:
                 try:
-                    self._capture.close()
+                    if self._capture and self._capture.poll() is None:
+                        self._capture.terminate()
                 except Exception:
                     pass
                 print("[*] Capture finished.")
 
         t = threading.Thread(target=_run, daemon=True)
         t.start()
-
-        if self.timeout > 0:
-            threading.Timer(self.timeout, self._safe_stop).start()
+        # NOTE: No Timer here - let tshark finish naturally via -a duration flag.
+        # Terminating tshark with SIGTERM causes it to not flush the pcap file.
 
     def _safe_stop(self):
         self._stop_event.set()
+        try:
+            if self._capture and hasattr(self._capture, "terminate"):
+                self._capture.terminate()
+        except Exception:
+            pass
 
     def stop_capture(self):
         """Stop capture immediately."""
@@ -143,15 +272,7 @@ class TrafficSniffer:
         Much faster than calling get_protocol_stats + get_flow_summary +
         get_protocol_timeseries separately (avoids 3 tshark spawns).
         """
-        proto_stats = {
-            'HTTP':    {'packets': 0, 'bytes': 0},
-            'DNS':     {'packets': 0, 'bytes': 0},
-            'TCP':     {'packets': 0, 'bytes': 0},
-            'UDP':     {'packets': 0, 'bytes': 0},
-            'ICMP':    {'packets': 0, 'bytes': 0},
-            'TLS/SSL': {'packets': 0, 'bytes': 0},
-            'ARP':     {'packets': 0, 'bytes': 0},
-        }
+        proto_stats = _init_proto_stats()
         total_packets = 0
         total_bytes = 0
         first_ts = None
@@ -168,7 +289,7 @@ class TrafficSniffer:
 
             cap = pyshark.FileCapture(
                 pcap_filename,
-                tshark_path=r"C:\Program Files\Wireshark\tshark.exe",
+                tshark_path=_DEFAULT_TSHARK,
             )
             for pkt in cap:
                 total_packets += 1
@@ -176,28 +297,7 @@ class TrafficSniffer:
                 total_bytes += pkt_size
                 proto_names = {p.layer_name.upper() for p in pkt.layers}
 
-                # Per-protocol stats
-                if 'HTTP' in proto_names:
-                    proto_stats['HTTP']['packets'] += 1
-                    proto_stats['HTTP']['bytes'] += pkt_size
-                if 'DNS' in proto_names:
-                    proto_stats['DNS']['packets'] += 1
-                    proto_stats['DNS']['bytes'] += pkt_size
-                if 'TCP' in proto_names:
-                    proto_stats['TCP']['packets'] += 1
-                    proto_stats['TCP']['bytes'] += pkt_size
-                if 'UDP' in proto_names:
-                    proto_stats['UDP']['packets'] += 1
-                    proto_stats['UDP']['bytes'] += pkt_size
-                if 'ICMPV6' in proto_names or 'ICMP' in proto_names:
-                    proto_stats['ICMP']['packets'] += 1
-                    proto_stats['ICMP']['bytes'] += pkt_size
-                if 'TLS' in proto_names or 'SSL' in proto_names:
-                    proto_stats['TLS/SSL']['packets'] += 1
-                    proto_stats['TLS/SSL']['bytes'] += pkt_size
-                if 'ARP' in proto_names:
-                    proto_stats['ARP']['packets'] += 1
-                    proto_stats['ARP']['bytes'] += pkt_size
+                _count_protocols(proto_names, pkt_size, proto_stats)
 
                 # Timestamps
                 ts = TrafficSniffer._get_sniff_time(pkt)
@@ -216,25 +316,20 @@ class TrafficSniffer:
                             rel = 0
                         bucket = int(rel // window_sec) * window_sec
                         if bucket not in timeseries:
+                            # Generate real ISO timestamp
+                            bucket_time = datetime.datetime.fromtimestamp(
+                                epoch0 + bucket, tz=datetime.timezone.utc
+                            ).strftime('%Y-%m-%dT%H:%M:%S')
                             timeseries[bucket] = {
-                                'time': datetime.timedelta(seconds=bucket + window_sec),
+                                'time': bucket_time,
                                 'HTTP': 0, 'DNS': 0, 'TCP': 0, 'UDP': 0, 'ICMP': 0,
                             }
-                        if 'HTTP' in proto_names:
-                            timeseries[bucket]['HTTP'] += 1
-                        if 'DNS' in proto_names:
-                            timeseries[bucket]['DNS'] += 1
-                        if 'TCP' in proto_names:
-                            timeseries[bucket]['TCP'] += 1
-                        if 'UDP' in proto_names:
-                            timeseries[bucket]['UDP'] += 1
-                        if 'ICMPV6' in proto_names or 'ICMP' in proto_names:
-                            timeseries[bucket]['ICMP'] += 1
+                        _count_timeseries_proto(proto_names, bucket, timeseries)
                     except (ValueError, TypeError):
                         pass
             cap.close()
         except Exception as exc:
-            print(f"[!] Single-pass analysis error: {exc}")
+            logger.error(f"Single-pass analysis error: {exc}")
 
         # Compute duration
         duration = 0.0
@@ -245,9 +340,7 @@ class TrafficSniffer:
         # Format timeseries
         ts_result = []
         for key in sorted(timeseries):
-            entry = timeseries[key]
-            entry['time'] = str(entry['time'])
-            ts_result.append(entry)
+            ts_result.append(timeseries[key])
 
         # Per-protocol counts for pie chart
         proto_counts = {p: d['packets'] for p, d in proto_stats.items() if d['packets'] > 0}
@@ -266,47 +359,19 @@ class TrafficSniffer:
     @staticmethod
     def get_protocol_stats(pcap_filename):
         """Read a pcap file and count packets + bytes per protocol."""
-        stats = {
-            'HTTP':    {'packets': 0, 'bytes': 0},
-            'DNS':     {'packets': 0, 'bytes': 0},
-            'TCP':     {'packets': 0, 'bytes': 0},
-            'UDP':     {'packets': 0, 'bytes': 0},
-            'ICMP':    {'packets': 0, 'bytes': 0},
-            'TLS/SSL': {'packets': 0, 'bytes': 0},
-            'ARP':     {'packets': 0, 'bytes': 0},
-        }
+        stats = _init_proto_stats()
         try:
             cap = pyshark.FileCapture(
                 pcap_filename,
-                tshark_path=r"C:\Program Files\Wireshark\tshark.exe",
+                tshark_path=_DEFAULT_TSHARK,
             )
             for pkt in cap:
                 pkt_size = int(pkt.length)
                 proto_names = {p.layer_name.upper() for p in pkt.layers}
-                if 'HTTP' in proto_names:
-                    stats['HTTP']['packets'] += 1
-                    stats['HTTP']['bytes'] += pkt_size
-                if 'DNS' in proto_names:
-                    stats['DNS']['packets'] += 1
-                    stats['DNS']['bytes'] += pkt_size
-                if 'TCP' in proto_names:
-                    stats['TCP']['packets'] += 1
-                    stats['TCP']['bytes'] += pkt_size
-                if 'UDP' in proto_names:
-                    stats['UDP']['packets'] += 1
-                    stats['UDP']['bytes'] += pkt_size
-                if 'ICMPV6' in proto_names or 'ICMP' in proto_names:
-                    stats['ICMP']['packets'] += 1
-                    stats['ICMP']['bytes'] += pkt_size
-                if 'TLS' in proto_names or 'SSL' in proto_names:
-                    stats['TLS/SSL']['packets'] += 1
-                    stats['TLS/SSL']['bytes'] += pkt_size
-                if 'ARP' in proto_names:
-                    stats['ARP']['packets'] += 1
-                    stats['ARP']['bytes'] += pkt_size
+                _count_protocols(proto_names, pkt_size, stats)
             cap.close()
         except Exception as exc:
-            print(f"[!] Error reading pcap: {exc}")
+            logger.error(f"Error reading pcap: {exc}")
         return stats
 
     @staticmethod
@@ -319,7 +384,7 @@ class TrafficSniffer:
         try:
             cap = pyshark.FileCapture(
                 pcap_filename,
-                tshark_path=r"C:\Program Files\Wireshark\tshark.exe",
+                tshark_path=_DEFAULT_TSHARK,
             )
             pkt_count = 0
             byte_count = 0
@@ -367,7 +432,7 @@ class TrafficSniffer:
         try:
             cap = pyshark.FileCapture(
                 pcap_filename,
-                tshark_path=r"C:\Program Files\Wireshark\tshark.exe",
+                tshark_path=_DEFAULT_TSHARK,
             )
             for pkt in cap:
                 ts = TrafficSniffer._get_sniff_time(pkt)
@@ -385,29 +450,21 @@ class TrafficSniffer:
                 except (ValueError, TypeError):
                     continue
                 if bucket not in timeseries:
+                    bucket_time = datetime.datetime.fromtimestamp(
+                        epoch0 + bucket, tz=datetime.timezone.utc
+                    ).strftime('%Y-%m-%dT%H:%M:%S')
                     timeseries[bucket] = {
-                        'time': datetime.timedelta(seconds=bucket + window_sec),
+                        'time': bucket_time,
                         'HTTP': 0, 'DNS': 0, 'TCP': 0, 'UDP': 0, 'ICMP': 0,
                     }
                 proto_names = {p.layer_name.upper() for p in pkt.layers}
-                if 'HTTP' in proto_names:
-                    timeseries[bucket]['HTTP'] += 1
-                if 'DNS' in proto_names:
-                    timeseries[bucket]['DNS'] += 1
-                if 'TCP' in proto_names:
-                    timeseries[bucket]['TCP'] += 1
-                if 'UDP' in proto_names:
-                    timeseries[bucket]['UDP'] += 1
-                if 'ICMPV6' in proto_names or 'ICMP' in proto_names:
-                    timeseries[bucket]['ICMP'] += 1
+                _count_timeseries_proto(proto_names, bucket, timeseries)
             cap.close()
         except Exception as exc:
-            print(f"[!] Error: {exc}")
+            logger.error(f"Error reading pcap: {exc}")
         result = []
         for key in sorted(timeseries):
-            entry = timeseries[key]
-            entry['time'] = str(entry['time'])
-            result.append(entry)
+            result.append(timeseries[key])
         return result
 
 

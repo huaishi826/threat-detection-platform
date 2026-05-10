@@ -7,14 +7,20 @@ Pipeline:
   3. generate_alerts() — convert anomaly flags to structured alerts
 
 Dependencies: numpy, scikit-learn, joblib
+
+SECURITY NOTE: joblib.load() uses pickle deserialization. Only load model
+files from trusted sources. Malicious .pkl files can execute arbitrary code.
 """
 
 import json
 import os
+import logging
 import numpy as np
 from sklearn.ensemble import IsolationForest
 import joblib
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def _load_ml_config():
@@ -76,8 +82,8 @@ class MLAnomalyDetector:
         )
         model.fit(feature_matrix)
         joblib.dump(model, model_path)
-        print(f"[*] Model trained ({feature_matrix.shape[0]} samples, "
-              f"{feature_matrix.shape[1]} features) -> {model_path}")
+        logger.info(f"Model trained ({feature_matrix.shape[0]} samples, "
+                    f"{feature_matrix.shape[1]} features) -> {model_path}")
         return model
 
     @staticmethod
@@ -179,32 +185,31 @@ if __name__ == "__main__":
     detector = MLAnomalyDetector()
 
     if X.shape[0] < 5:
-        print(f"[!] Only {X.shape[0]} windows -- need >= 5.  "
-              f"Use a longer pcap or smaller window_size.")
+        logger.warning(f"Only {X.shape[0]} windows -- need >= 5.  "
+                       f"Use a longer pcap or smaller window_size.")
         sys.exit(1)
 
     # train if model does not exist
     if not Path(model_path).exists():
-        print(f"[*] Training model from {pcap} ...")
+        logger.info(f"Training model from {pcap} ...")
         detector.train(X, model_path)
     else:
-        print(f"[*] Using existing model: {model_path}")
+        logger.info(f"Using existing model: {model_path}")
 
     # predict
     scores, is_anom = MLAnomalyDetector.predict(X, model_path)
     timestamps = [f"window_{i}" for i in range(len(scores))]
 
-    print(f"  Windows:       {len(scores)}")
-    print(f"  Anomalies:     {is_anom.sum()}")
-    print(f"  Anomaly ratio: {is_anom.mean():.1%}\n")
+    logger.info(f"Windows: {len(scores)}, Anomalies: {is_anom.sum()}, "
+                f"Anomaly ratio: {is_anom.mean():.1%}")
 
     # alerts
     alerts = MLAnomalyDetector.generate_alerts(
         timestamps, is_anom, scores, X, names)
     if alerts:
-        print(f"  {len(alerts)} ML alert(s):\n")
+        logger.info(f"{len(alerts)} ML alert(s)")
         for a in alerts:
-            print(f"  [{a['severity'].upper():6s}] score={a['anomaly_score']}")
-            print(f"         {a['detail']}\n")
+            logger.info(f"[{a['severity'].upper():6s}] score={a['anomaly_score']} "
+                        f"{a['detail']}")
     else:
-        print("  No ML anomalies detected.")
+        logger.info("No ML anomalies detected.")

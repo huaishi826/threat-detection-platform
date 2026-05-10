@@ -1,67 +1,49 @@
-version: "3.8"
-
-services:
+﻿services:
   backend:
     build:
       context: .
       dockerfile: Dockerfile.backend
+    container_name: threatsight-backend
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
     ports:
       - "5000:5000"
-    environment:
-      - DEMO_MODE=${DEMO_MODE:-false}
-      - DB_PATH=/app/threatsight.db
+    env_file: .env
     volumes:
       - ./config.json:/app/config.json
-      - ./threatsight.db:/app/threatsight.db
       - ./samples:/app/samples
       - ./results:/app/results
       - ./captures:/app/captures
+      - threatsight_db:/app/data
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/health')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/health')",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
 
   frontend:
     build:
       context: .
       dockerfile: Dockerfile.frontend
+    container_name: threatsight-frontend
     ports:
       - "80:80"
+      - "443:443"
+    volumes:
+      - ./ssl:/etc/nginx/ssl:ro
     depends_on:
       backend:
         condition: service_healthy
     restart: unless-stopped
 
-  influxdb:
-    image: influxdb:2.7
-    ports:
-      - "8086:8086"
-    environment:
-      - DOCKER_INFLUXDB_INIT_MODE=setup
-      - DOCKER_INFLUXDB_INIT_USERNAME=admin
-      - DOCKER_INFLUXDB_INIT_PASSWORD=admin123
-      - DOCKER_INFLUXDB_INIT_ORG=threatsight
-      - DOCKER_INFLUXDB_INIT_BUCKET=traffic
-      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=secret-token
-    volumes:
-      - influxdb_data:/var/lib/influxdb2
-    restart: unless-stopped
-
-  grafana:
-    image: grafana/grafana:latest
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-    depends_on:
-      - influxdb
-    volumes:
-      - grafana_data:/var/lib/grafana
-    restart: unless-stopped
-
 volumes:
-  influxdb_data:
-  grafana_data:
+  threatsight_db:

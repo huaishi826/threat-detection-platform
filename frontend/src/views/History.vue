@@ -80,7 +80,12 @@ const currentTime = ref('')
 
 function formatTime(iso) {
   if (!iso) return '-'
-  const d = new Date(iso)
+  if (typeof iso === 'string' && !iso.includes('T') && !iso.includes('-')) return iso
+  let d = new Date(iso)
+  if (isNaN(d.getTime()) && typeof iso === 'string' && !iso.includes('+') && !iso.endsWith('Z')) {
+    d = new Date(iso + 'Z')
+  }
+  if (isNaN(d.getTime())) return iso
   return d.toLocaleString('zh-CN', {
     year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit',

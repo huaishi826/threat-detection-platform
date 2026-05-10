@@ -13,8 +13,10 @@ Each detector returns a list of alert dicts with keys:
 import json
 import os
 import datetime
+import logging
 from collections import defaultdict
 
+logger = logging.getLogger(__name__)
 
 # ─── config loader ───────────────────────────────────────────────────
 
@@ -41,6 +43,8 @@ def load_rules_config():
 
 import pyshark
 
+_TSHARK = os.environ.get("TSHARK_PATH", "tshark")
+
 
 # ─── helpers ────────────────────────────────────────────────────────
 
@@ -48,20 +52,24 @@ def _open_pcap(pcap_file):
     """Open a pcap file with PyShark (text mode)."""
     return pyshark.FileCapture(
         pcap_file,
-        tshark_path=r"C:\Program Files\Wireshark\tshark.exe",
+        tshark_path=_TSHARK,
     )
 
 
 def _get_sniff_time(pkt):
     """Safely extract sniff datetime from a packet."""
     try:
-        return pkt.sniff_time
+        ts = pkt.sniff_time
     except (ValueError, TypeError):
         raw = str(getattr(pkt, "sniff_timestamp", ""))
         try:
-            return datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            ts = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
         except Exception:
             return None
+    # pcap timestamps are always UTC; make them timezone-aware
+    if ts and ts.tzinfo is None:
+        ts = ts.replace(tzinfo=datetime.timezone.utc)
+    return ts
 
 
 def _tcp_flag_set(pkt, flag):
@@ -137,7 +145,7 @@ def detect_syn_flood(pcap_file, window=None, threshold=None, min_packets=None):
                 continue
         cap.close()
     except Exception as exc:
-        print(f"[!] Error reading pcap: {exc}")
+        logger.error(f"Error reading pcap: {exc}")
 
     for win_key, data in sorted(windows.items()):
         if data["tcp"] < min_packets:
@@ -212,7 +220,7 @@ def detect_dns_tunnel(pcap_file, window=None, query_threshold=None,
                 continue
         cap.close()
     except Exception as exc:
-        print(f"[!] Error reading pcap: {exc}")
+        logger.error(f"Error reading pcap: {exc}")
 
     for win_key, domains in sorted(dns_data.items()):
         for qname, data in domains.items():
@@ -290,7 +298,7 @@ def detect_port_scan(pcap_file, window=None, port_threshold=None):
                 continue
         cap.close()
     except Exception as exc:
-        print(f"[!] Error reading pcap: {exc}")
+        logger.error(f"Error reading pcap: {exc}")
 
     for win_key, sources in sorted(scan_data.items()):
         for src_ip, data in sources.items():

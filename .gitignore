@@ -6,3 +6,6 @@ captures/*.pcap
 results/*.json
 frontend/node_modules/
 frontend/dist/
+.env
+*.db
+threatsight.db

@@ -5,6 +5,7 @@
       <div class="nav-brand">
         <LogoIcon />
         <span class="brand-text">ThreatSight</span>
+        <el-tag v-if="isDemo && hasData" type="warning" size="small" effect="dark" style="margin-left:8px">DEMO</el-tag>
       </div>
       <div class="nav-right">
         <router-link to="/history" class="nav-link">📋 历史记录</router-link>
@@ -51,6 +52,25 @@
       </el-button>
     </section>
 
+    <!-- capture error -->
+    <el-alert
+      v-if="captureError"
+      :title="captureError"
+      type="error"
+      show-icon
+      closable
+      @close="captureError = ''"
+      style="margin-bottom:16px"
+    />
+
+    <!-- result toast -->
+    <transition name="slide-down">
+      <div v-if="resultToast.show" class="result-toast" :class="resultToast.type">
+        <span>{{ resultToast.type === 'success' ? '✅' : '⚠️' }}</span>
+        <span>{{ resultToast.message }}</span>
+      </div>
+    </transition>
+
     <!-- empty state -->
     <div v-if="!hasData && !running" class="empty-state">
       <div class="empty-icon">📡</div>
@@ -90,7 +110,11 @@
             </div>
             <el-table :data="filteredAlerts" stripe max-height="280"
                       style="width:100%">
-              <el-table-column prop="timestamp" label="时间" width="180" />
+              <el-table-column label="时间" width="180">
+                <template #default="{ row }">
+                  {{ formatTime(row.timestamp) }}
+                </template>
+              </el-table-column>
               <el-table-column prop="type" label="类型" width="130" />
               <el-table-column label="等级" width="90">
                 <template #default="{ row }">
@@ -134,10 +158,32 @@ const timeSeries = ref([])
 const healthOk = ref(null)
 const exporting = ref(false)
 const reportArea = ref(null)
+const isDemo = ref(false)  // whether showing demo data
+const resultToast = ref({ show: false, message: '', type: 'success' })  // result notification
+const captureError = ref('')  // capture-level error message
+
+// Time formatting: parse UTC timestamp to local readable string
+function formatTime(iso) {
+  if (!iso) return '-'
+  // Handle non-ISO timestamps like "window_0", "0:00:05"
+  if (typeof iso === 'string' && !iso.includes('T') && !iso.includes('-')) return iso
+  let d = new Date(iso)
+  // If no timezone info, treat as UTC
+  if (isNaN(d.getTime()) && typeof iso === 'string' && !iso.includes('+') && !iso.endsWith('Z')) {
+    d = new Date(iso + 'Z')
+  }
+  if (isNaN(d.getTime())) return iso  // fallback to raw string
+  return d.toLocaleString('zh-CN', {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  })
+}
 
 let clockTimer = null
 let progressTimer = null
 let healthTimer = null
+let progressPollTimer = null  // backend progress polling
+let statsTimer = null  // stats polling
 
 // computed
 const hasData = computed(() => {
@@ -238,32 +284,48 @@ async function startCapture() {
   try {
     running.value = true
     analyzing.value = false
-    statusText.value = '抓包中...'
-    const { data } = await axios.post('/api/capture', {
+    captureError.value = ''
+    statusText.value = '正在启动抓包...'
+    const { data: capData } = await axios.post('/api/capture', {
       duration: duration.value,
       interface: null,
     })
-    const pcapName = data.pcap_file.split(/[\\/]/).pop()
+    const pcapName = capData.pcap_file.split(/[\\/]/).pop()
+    if (!pcapName) {
+      captureError.value = '抓包启动失败：未获取到文件名'
+      running.value = false
+      return
+    }
+    statusText.value = '抓包中...'
 
-    // progress polling
-    let elapsed = 0
-    progressTimer = setInterval(() => {
-      elapsed += 1
-      summary.value._progress = elapsed
-      if (elapsed >= duration.value) clearInterval(progressTimer)
-    }, 1000)
+    // Poll backend progress instead of fake counter
+    clearInterval(progressPollTimer)
+    progressPollTimer = setInterval(async () => {
+      try {
+        const { data: prog } = await axios.get('/api/capture/progress', { timeout: 3000 })
+        summary.value._progress = prog.elapsed
+        // Check for capture-level error
+        if (prog.capture_error) {
+          clearInterval(progressPollTimer)
+          captureError.value = '抓包错误: ' + prog.capture_error
+          statusText.value = '抓包失败'
+          running.value = false
+          return
+        }
+        if (!prog.running) {
+          clearInterval(progressPollTimer)
+          // Capture finished — start analysis
+          statusText.value = '分析中...'
+          analyzing.value = true
+          await analyze(pcapName)
+        }
+      } catch { /* ignore poll errors */ }
+    }, 1500)
 
-    // wait for capture to finish, then analyse
-    const wait = duration.value * 1000 + 3000
-    setTimeout(() => {
-      clearInterval(progressTimer)
-      statusText.value = '分析中...'
-      analyzing.value = true
-      analyze(pcapName)
-    }, wait)
   } catch (e) {
     running.value = false
     analyzing.value = false
+    captureError.value = '抓包启动失败: ' + (e.response?.data?.error || e.message || '请检查是否以管理员权限运行')
     statusText.value = '抓包失败'
     console.error(e)
   }
@@ -271,19 +333,30 @@ async function startCapture() {
 
 async function analyze(pcapName) {
   try {
-    // 120s timeout for large pcap files
-    const { data } = await axios.get('/api/analyze/' + pcapName, { timeout: 120000 })
-    summary.value = data.summary
-    summary.value.alert_count = data.alert_count
-    summary.value.rule_alert_count = data.rule_alert_count
-    summary.value.ml_alert_count = data.ml_alert_count
-    protocolStats.value = data.protocol_stats
-    alerts.value = data.alerts
-    timeSeries.value = data.time_series || []
-    statusText.value = '分析完成'
+    // 300s timeout for large pcap files
+    const { data } = await axios.get('/api/analyze/' + pcapName, { timeout: 300000 })
+    if (data.status === 'ok') {
+      summary.value = data.summary
+      summary.value.alert_count = data.alert_count
+      summary.value.rule_alert_count = data.rule_alert_count
+      summary.value.ml_alert_count = data.ml_alert_count
+      protocolStats.value = data.protocol_stats
+      alerts.value = data.alerts
+      timeSeries.value = data.time_series || []
+      isDemo.value = false
+      statusText.value = '分析完成'
+      // Show result notification
+      const msg = data.message || `完成：${data.total_packets || 0} 包，${data.alert_count || 0} 告警`
+      resultToast.value = { show: true, message: msg, type: data.alert_count > 0 ? 'warning' : 'success' }
+      setTimeout(() => { resultToast.value.show = false }, 5000)
+    } else {
+      statusText.value = '分析失败: ' + (data.error || '未知错误')
+      captureError.value = statusText.value
+    }
   } catch (e) {
-    const msg = e.response && e.response.data && e.response.data.error
-    statusText.value = '分析失败: ' + (msg || e.message || '未知错误')
+    const msg = e.response?.data?.error
+    statusText.value = '分析失败: ' + (msg || e.message || '网络超时，请重试')
+    captureError.value = statusText.value
     console.error(e)
   } finally {
     running.value = false
@@ -300,7 +373,10 @@ async function pollStats() {
       summary.value.rule_alert_count = data.rule_alert_count
       summary.value.ml_alert_count = data.ml_alert_count
       protocolStats.value = data.protocol_stats
+      alerts.value = data.alerts || []
+      timeSeries.value = data.time_series || []
       running.value = data.capture_running
+      isDemo.value = data.is_demo || false
     }
   } catch { /* ignore */ }
 }
@@ -351,15 +427,17 @@ async function exportPDF() {
 onMounted(() => {
   updateTime()
   clockTimer = setInterval(updateTime, 1000)
-  setInterval(pollStats, 30000)
+  pollStats()  // Load data immediately on page open
+  statsTimer = setInterval(pollStats, 30000)
   checkHealth()
   healthTimer = setInterval(checkHealth, 10000)
 })
 
 onUnmounted(() => {
   clearInterval(clockTimer)
-  clearInterval(progressTimer)
+  clearInterval(progressPollTimer)
   clearInterval(healthTimer)
+  clearInterval(statsTimer)
 })
 </script>
 
@@ -508,5 +586,41 @@ onUnmounted(() => {
   margin: 0 0 12px 0;
   font-size: 14px;
   color: #94a3b8;
+}
+
+/* result toast */
+.result-toast {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 20px;
+  border-radius: 10px;
+  margin-bottom: 16px;
+  font-size: 14px;
+  font-weight: 600;
+}
+.result-toast.success {
+  background: rgba(34, 197, 94, 0.12);
+  border: 1px solid rgba(34, 197, 94, 0.3);
+  color: #86efac;
+}
+.result-toast.warning {
+  background: rgba(251, 191, 36, 0.12);
+  border: 1px solid rgba(251, 191, 36, 0.3);
+  color: #fde68a;
+}
+
+.slide-down-enter-active {
+  transition: all 0.35s ease;
+}
+.slide-down-leave-active {
+  transition: all 0.25s ease;
+}
+.slide-down-enter-from {
+  opacity: 0;
+  transform: translateY(-12px);
+}
+.slide-down-leave-to {
+  opacity: 0;
 }
 </style>

@@ -1,18 +1,35 @@
-# Backend: Python API
-FROM python:3.10-slim
+FROM docker.m.daocloud.io/library/python:3.10-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    tshark net-tools && \
+# Disable proxy inside container
+ENV http_proxy=
+ENV https_proxy=
+ENV HTTP_PROXY=
+ENV HTTPS_PROXY=
+
+# Use China apt mirror and install tshark
+RUN sed -i 's|http://deb.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true && \
+    echo "deb http://mirrors.aliyun.com/debian/ trixie main contrib non-free non-free-firmware" > /etc/apt/sources.list && \
+    echo "deb http://mirrors.aliyun.com/debian/ trixie-updates main contrib non-free non-free-firmware" >> /etc/apt/sources.list && \
+    echo "deb http://mirrors.aliyun.com/debian-security/ trixie-security main contrib non-free non-free-firmware" >> /etc/apt/sources.list && \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark net-tools && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY backend/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-COPY backend/ .
+COPY app.py rule_detector.py feature_extractor.py ml_detector.py sniffer.py ./
+COPY config.json ./
+COPY samples/ ./samples/
+
 RUN mkdir -p captures results
+
+ENV TSHARK_PATH=/usr/bin/tshark
+ENV DEMO_MODE=true
+ENV DB_PATH=/app/threatsight.db
 
 EXPOSE 5000
 
-CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:5000", "--timeout", "300", "app:app"]
+CMD ["python", "app.py"]
