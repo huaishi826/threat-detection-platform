@@ -1,22 +1,27 @@
 """
 Feature extraction from pcap files for ML anomaly detection.
 
-Extracts 15 features per time window:
+Extracts 14 features per time window:
   - Traffic volume: pps, avg packet size
   - TCP flag ratios: SYN, ACK, RST, FIN
   - Diversity: unique dst ports, unique src IPs
   - Protocol mix: TCP, UDP, DNS, ICMP ratios
   - Direction: inbound, outbound ratios
 
-Output: numpy array of shape [n_windows, 15]
+Output: numpy array of shape [n_windows, 14]
 """
 
 import datetime
+import logging
+import os
 import socket
 from collections import defaultdict
 
 import numpy as np
 import pyshark
+
+logger = logging.getLogger(__name__)
+_TSHARK = os.environ.get("TSHARK_PATH", "tshark")
 
 
 # ─── helpers ────────────────────────────────────────────────────────
@@ -69,7 +74,7 @@ class FeatureExtractor:
 
     Usage:
         fe = FeatureExtractor(window_size=10)
-        matrix = fe.extract("traffic.pcap")  # shape [n_windows, 15]
+        matrix = fe.extract("traffic.pcap")  # shape [n_windows, 14]
         names  = fe.get_feature_names()       # list[str]
     """
 
@@ -102,7 +107,7 @@ class FeatureExtractor:
             pcap_file: Path to .pcap file.
 
         Returns:
-            np.ndarray of shape [n_windows, 15], or [0, 15] if empty.
+            np.ndarray of shape [n_windows, 14], or [0, 14] if empty.
         """
         local_ip = _get_local_ip()
         windows = defaultdict(lambda: {
@@ -117,7 +122,7 @@ class FeatureExtractor:
         try:
             cap = pyshark.FileCapture(
                 pcap_file,
-                tshark_path=r"C:\Program Files\Wireshark\tshark.exe",
+                tshark_path=_TSHARK,
             )
             for pkt in cap:
                 try:
@@ -180,7 +185,7 @@ class FeatureExtractor:
                     continue
             cap.close()
         except Exception as exc:
-            print(f"[!] Error: {exc}")
+            logger.error(f"Feature extraction error: {exc}")
 
         return self._build_matrix(windows)
 
@@ -192,7 +197,7 @@ class FeatureExtractor:
             duration:  Capture seconds.
 
         Returns:
-            np.ndarray of shape [n_windows, 15].
+            np.ndarray of shape [n_windows, 14].
         """
         import tempfile, os
         pcap_path = os.path.join(tempfile.gettempdir(), "_feat_capture.pcap")

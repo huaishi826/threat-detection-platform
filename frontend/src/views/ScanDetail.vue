@@ -43,7 +43,11 @@
         max-height="500"
         v-loading="loading"
       >
-        <el-table-column prop="timestamp" label="时间" width="180" />
+        <el-table-column label="时间" width="180">
+          <template #default="{ row }">
+            {{ formatTime(row.timestamp) }}
+          </template>
+        </el-table-column>
         <el-table-column prop="type" label="类型" width="130" />
         <el-table-column label="等级" width="90">
           <template #default="{ row }">
@@ -79,7 +83,16 @@ function tagType(severity) {
 
 function formatTime(iso) {
   if (!iso) return '-'
-  return new Date(iso).toLocaleString('zh-CN')
+  if (typeof iso === 'string' && !iso.includes('T') && !iso.includes('-')) return iso
+  let d = new Date(iso)
+  if (isNaN(d.getTime()) && typeof iso === 'string' && !iso.includes('+') && !iso.endsWith('Z')) {
+    d = new Date(iso + 'Z')
+  }
+  if (isNaN(d.getTime())) return iso
+  return d.toLocaleString('zh-CN', {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  })
 }
 
 async function fetchDetail() {

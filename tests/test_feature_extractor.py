@@ -60,3 +60,78 @@ class TestFeatureExtractor:
         # smaller window = more rows
         assert X5.shape[0] >= X20.shape[0], \
             "Smaller window should produce >= rows"
+
+
+class TestFeatureExtractorHelpers:
+    """Test helper functions in feature_extractor module."""
+
+    def test_get_local_ip_returns_string(self):
+        ip = feature_extractor._get_local_ip()
+        assert isinstance(ip, str)
+        # Should be a valid IP format
+        parts = ip.split(".")
+        assert len(parts) == 4
+
+    def test_get_sniff_time_valid(self):
+        import datetime
+        class FakePkt:
+            sniff_time = datetime.datetime(2026, 1, 1, 12, 0, 0)
+        ts = feature_extractor._get_sniff_time(FakePkt())
+        assert ts == datetime.datetime(2026, 1, 1, 12, 0, 0)
+
+    def test_get_sniff_time_none(self):
+        class FakePkt:
+            sniff_time = None
+            sniff_timestamp = ""
+        ts = feature_extractor._get_sniff_time(FakePkt())
+        assert ts is None
+
+    def test_tcp_flag_set_syn(self):
+        class FakePkt:
+            class tcp:
+                flags_syn = "1"
+        assert feature_extractor._tcp_flag_set(FakePkt(), "syn") is True
+
+    def test_tcp_flag_set_syn_false(self):
+        class FakePkt:
+            class tcp:
+                flags_syn = "0"
+        assert feature_extractor._tcp_flag_set(FakePkt(), "syn") is False
+
+    def test_tcp_flag_set_hex(self):
+        class FakePkt:
+            class tcp:
+                flags = "0x02"  # SYN flag
+        assert feature_extractor._tcp_flag_set(FakePkt(), "syn") is True
+
+    def test_tcp_flag_set_no_tcp(self):
+        class FakePkt:
+            pass
+        assert feature_extractor._tcp_flag_set(FakePkt(), "syn") is False
+
+
+class TestBuildMatrix:
+    """Test _build_matrix internal method."""
+
+    def test_empty_windows(self):
+        fe = feature_extractor.FeatureExtractor(window_size=10)
+        result = fe._build_matrix({})
+        assert result.shape == (0, 14)
+
+    def test_single_window(self):
+        fe = feature_extractor.FeatureExtractor(window_size=10)
+        from collections import defaultdict
+        windows = {
+            0: {
+                "packets": 10, "total_bytes": 1000,
+                "syn": 5, "ack": 3, "rst": 1, "fin": 1,
+                "tcp": 8, "udp": 2, "dns": 1, "icmp": 0,
+                "ports": {80, 443}, "src_ips": {"10.0.0.1"},
+                "inbound": 6, "outbound": 4,
+                "order": "2026-01-01T00:00:00",
+            }
+        }
+        result = fe._build_matrix(windows)
+        assert result.shape == (1, 14)
+        assert result[0, 0] == 1.0  # packets_per_sec = 10/10
+        assert result[0, 1] == 100.0  # avg_packet_size = 1000/10

@@ -1,18 +1,18 @@
 """
-ThreatSight — Flask REST API
+ThreatSight —Flask REST API
 
 Endpoints:
-  GET  /                    — service info
-  GET  /api/health          — health check
-  POST /api/capture         — start background capture
-  POST /api/capture/stop    — manual stop
-  GET  /api/analyze/<pcap>  — run full analysis
-  GET  /api/stats           — last analysis summary
-  GET  /api/alerts          — alert list (optional ?severity=high|medium|low)
-  GET  /api/scans           — paginated scan history
-  GET  /api/scans/<id>      — scan detail with alerts
-  GET  /api/config          — read configuration
-  POST /api/config          — update configuration
+  GET  /                    —service info
+  GET  /api/health          —health check
+  POST /api/capture         —start background capture
+  POST /api/capture/stop    —manual stop
+  GET  /api/analyze/<pcap>  —run full analysis
+  GET  /api/stats           —last analysis summary
+  GET  /api/alerts          —alert list (optional ?severity=high|medium|low)
+  GET  /api/scans           —paginated scan history
+  GET  /api/scans/<id>      —scan detail with alerts
+  GET  /api/config          —read configuration
+  POST /api/config          —update configuration
 """
 
 import os
@@ -20,6 +20,9 @@ import json
 import asyncio
 import threading
 import datetime
+import time
+import logging
+import functools
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -28,6 +31,19 @@ from dotenv import load_dotenv
 from flasgger import Swagger
 
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+# Fix asyncio child watcher for pyshark on Python 3.10+
+import asyncio
+try:
+    policy = asyncio.get_event_loop_policy()
+    if hasattr(policy, "set_child_watcher"):
+        watcher = asyncio.ThreadedChildWatcher()
+        policy.set_child_watcher(watcher)
+except Exception:
+    pass
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -38,8 +54,54 @@ from feature_extractor import FeatureExtractor
 from ml_detector import MLAnomalyDetector
 
 app = Flask(__name__)
-CORS(app)
+
+# CORS: only allow dev proxy and Docker frontend
+CORS(app, resources={
+    r"/api/*": {"origins": os.getenv("CORS_ORIGINS", "http://localhost:5174,http://localhost:80").split(",")}
+})
+
 swagger = Swagger(app)
+
+
+# ─── Unified error handlers ────────────────────────────────────────
+
+@app.errorhandler(400)
+def bad_request(e):
+    return jsonify({"error": str(e), "code": 400}), 400
+
+@app.errorhandler(401)
+def unauthorized(e):
+    return jsonify({"error": "Unauthorized", "code": 401}), 401
+
+@app.errorhandler(403)
+def forbidden(e):
+    return jsonify({"error": "Forbidden", "code": 403}), 403
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"error": "Resource not found", "code": 404}), 404
+
+@app.errorhandler(429)
+def rate_limited(e):
+    return jsonify({"error": "Rate limit exceeded", "code": 429}), 429
+
+@app.errorhandler(500)
+def internal_error(e):
+    logger.error(f"Internal error: {e}")
+    return jsonify({"error": "Internal server error", "code": 500}), 500
+
+# API Key authentication (empty = disabled, set via env to enable)
+API_KEY = os.getenv("API_KEY", "")
+
+
+def require_auth(f):
+    """Protect endpoints with X-API-Key header when API_KEY is set."""
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if API_KEY and request.headers.get("X-API-Key") != API_KEY:
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(*args, **kwargs)
+    return decorated
 
 DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() in ("true", "1")
 
@@ -91,7 +153,7 @@ def _validate_config(data):
 os.makedirs(CAPTURE_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-# ─── SQLAlchemy ──────────────────────────────────────────────────────
+# 鈹€鈹€鈹€ SQLAlchemy 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{DB_PATH}"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -113,7 +175,7 @@ class ScanRecord(db.Model):
     def to_dict(self):
         return {
             "id": self.id,
-            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+            "timestamp": self.timestamp.replace(tzinfo=datetime.timezone.utc).isoformat() if self.timestamp else None,
             "total_packets": self.total_packets,
             "total_bytes": self.total_bytes,
             "duration": self.duration,
@@ -137,7 +199,7 @@ class Alert(db.Model):
         return {
             "id": self.id,
             "scan_id": self.scan_id,
-            "timestamp": self.timestamp,
+            "timestamp": (self.timestamp + "+00:00") if self.timestamp and "+" not in self.timestamp and "Z" not in self.timestamp else self.timestamp,
             "type": self.type,
             "severity": self.severity,
             "source_ip": self.source_ip,
@@ -145,16 +207,21 @@ class Alert(db.Model):
         }
 
 
-# shared state (single-user demo)
+# shared state (single-user demo) — protected by _state_lock
+_state_lock = threading.Lock()
 _state = {
     "last_result": None,
+    "demo_data": None,
     "capture_running": False,
     "capture_progress": 0,
     "capture_total": 0,
+    "capture_pcap": None,
+    "capture_started_at": 0,
+    "capture_process": None,    # tshark subprocess reference
 }
 
 
-# ─── API ─────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€ API 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 @app.route("/")
 def index():
@@ -189,6 +256,7 @@ def health():
 
 
 @app.route("/api/capture/stop", methods=["POST"])
+@require_auth
 def stop_capture():
     """
     Manually stop an in-progress capture
@@ -201,17 +269,24 @@ def stop_capture():
         examples:
           application/json: {"status": "stopped"}
     """
-    _state["capture_running"] = False
-    try:
-        import subprocess
-        subprocess.run(["taskkill", "/F", "/IM", "tshark.exe"],
-                       capture_output=True, timeout=5)
-    except Exception:
-        pass
+    with _state_lock:
+        _state["capture_running"] = False
+        proc = _state.get("capture_process")
+    if proc and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    logger.info("Capture stopped by user")
     return jsonify({"status": "stopped"})
 
 
 @app.route("/api/capture", methods=["POST"])
+@require_auth
 def start_capture():
     """
     Start a background packet capture
@@ -244,28 +319,54 @@ def start_capture():
     ts_tag = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     pcap_file = os.path.join(CAPTURE_DIR, f"capture_{ts_tag}.pcap")
 
-    _state["capture_running"] = True
-    _state["capture_progress"] = 0
-    _state["capture_total"] = duration
+
+    with _state_lock:
+        _state["capture_running"] = True
+        _state["capture_progress"] = 0
+        _state["capture_total"] = duration
+        _state["capture_started_at"] = time.time()
+        _state["capture_process"] = None
+
+    capture_error = [None]  # mutable container for error reporting
+
+    capture_thread = [None]
 
     def _run():
-        sniffer = TrafficSniffer(interface=interface, timeout=duration)
-        sniffer.start_capture(pcap_file)
-        sniffer._stop_event.wait(timeout=duration + 10)
-        sniffer.stop_capture()
-        _state["capture_running"] = False
-        _state["capture_pcap"] = pcap_file
+        try:
+            sniffer = TrafficSniffer(interface=interface, timeout=duration)
+            sniffer.start_capture(pcap_file)
+            with _state_lock:
+                _state["capture_process"] = sniffer._capture
+            deadline = time.time() + duration + 15
+            while time.time() < deadline:
+                result = sniffer._capture_result[0] if sniffer._capture_result else None
+                if result is not None:
+                    break
+                time.sleep(0.5)
+            result = sniffer._capture_result[0] if sniffer._capture_result else None
+            if isinstance(result, str):
+                capture_error[0] = result
+        except Exception as e:
+            capture_error[0] = str(e)
+            logger.error(f"Capture error: {e}")
+        finally:
+            with _state_lock:
+                _state["capture_running"] = False
+                _state["capture_pcap"] = pcap_file
+                _state["capture_error"] = capture_error[0]
+                _state["capture_process"] = None
 
     threading.Thread(target=_run, daemon=True).start()
 
     return jsonify({
         "status": "capturing",
-        "pcap_file": pcap_file,
+        "pcap_file": os.path.basename(pcap_file),
         "duration": duration,
     })
 
 
 @app.route("/api/analyze/<path:pcap_filename>")
+@require_auth
 def analyze(pcap_filename):
     """
     Run rule + ML detection on a pcap file and persist to SQLite
@@ -277,16 +378,25 @@ def analyze(pcap_filename):
         in: path
         type: string
         required: true
-        description: Pcap file name (relative to captures/) or absolute path
+        description: Pcap file name (relative to captures/)
     responses:
       200:
         description: Analysis result
+      400:
+        description: Invalid filename
       404:
         description: File not found
       500:
         description: Analysis error
     """
-    pcap_path = pcap_filename if os.path.isabs(pcap_filename) else os.path.join(CAPTURE_DIR, pcap_filename)
+    # Path traversal protection: reject absolute paths and directory traversal
+    if os.path.isabs(pcap_filename) or ".." in pcap_filename or "/" in pcap_filename or "\\" in pcap_filename:
+        logger.warning(f"Path traversal attempt blocked: {pcap_filename}")
+        return jsonify({"error": "Invalid filename"}), 400
+    pcap_path = os.path.join(CAPTURE_DIR, os.path.basename(pcap_filename))
+    # Double-check resolved path is within CAPTURE_DIR
+    if not os.path.realpath(pcap_path).startswith(os.path.realpath(CAPTURE_DIR)):
+        return jsonify({"error": "Access denied"}), 403
     if not os.path.exists(pcap_path):
         return jsonify({"error": f"File not found: {pcap_filename}"}), 404
 
@@ -304,7 +414,23 @@ def analyze(pcap_filename):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
-        analysis = TrafficSniffer.analyze_pcap(pcap_path, window_sec=5)
+        # Run pyshark in subprocess to avoid asyncio event loop conflicts in Werkzeug threads
+        import subprocess as _sub
+        _analyzer_script = (
+            'import asyncio, sys, json, os\n'
+            'try: asyncio.get_event_loop()\n'
+            'except RuntimeError: asyncio.set_event_loop(asyncio.new_event_loop())\n'
+            'sys.path.insert(0, sys.argv[1])\n'
+            'from sniffer import TrafficSniffer\n'
+            'result = TrafficSniffer.analyze_pcap(sys.argv[2], window_sec=5)\n'
+            'json.dump(result, sys.stdout, default=str)'
+        )
+        _proc = _sub.run([sys.executable, '-c', _analyzer_script, BASE_DIR, pcap_path],
+                         capture_output=True, text=True, timeout=300)
+        if _proc.returncode == 0 and _proc.stdout.strip():
+            analysis = json.loads(_proc.stdout)
+        else:
+            analysis = {'stats': {}, 'summary': {'total_packets': 0, 'total_bytes': 0, 'duration_sec': 0, 'avg_packet_size': 0}, 'time_series': []}
         proto_counts = analysis["stats"]
         ts_data = analysis["time_series"]
         flow = analysis["summary"]
@@ -326,7 +452,9 @@ def analyze(pcap_filename):
         all_alerts = rule_alerts + ml_alerts
         all_alerts.sort(key=lambda a: a.get("timestamp", ""))
 
+        total_pkts = flow.get("total_packets", 0)
         result = {
+            "status": "ok",
             "summary": flow,
             "protocol_stats": proto_counts,
             "time_series": ts_data,
@@ -334,37 +462,43 @@ def analyze(pcap_filename):
             "alert_count": len(all_alerts),
             "rule_alert_count": len(rule_alerts),
             "ml_alert_count": len(ml_alerts),
+            "total_packets": total_pkts,
+            "message": "Analysis complete: " + str(total_pkts) + " packets, " + str(len(all_alerts)) + " alerts" if total_pkts > 0 else "No traffic data detected in capture file",
         }
-
         _state["last_result"] = result
 
-        # ─── Persist to SQLite ───────────────────────────────────────
-        scan = ScanRecord(
-            total_packets=flow.get("total_packets", 0),
-            total_bytes=flow.get("total_bytes", 0),
-            duration=flow.get("duration", 0),
-            alert_count=len(all_alerts),
-            rule_alert_count=len(rule_alerts),
-            ml_alert_count=len(ml_alerts),
-            protocol_stats_json=json.dumps(proto_counts, ensure_ascii=False),
-        )
-        db.session.add(scan)
-        db.session.flush()  # get scan.id
-
-        for a in all_alerts:
-            alert = Alert(
-                scan_id=scan.id,
-                timestamp=str(a.get("timestamp", "")),
-                type=a.get("type", ""),
-                severity=a.get("severity", ""),
-                source_ip=a.get("source_ip", ""),
-                detail=a.get("detail", ""),
+        # 鈹€鈹€鈹€ Persist to SQLite 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        try:
+            scan = ScanRecord(
+                total_packets=flow.get("total_packets", 0),
+                total_bytes=flow.get("total_bytes", 0),
+                duration=flow.get("duration", 0),
+                alert_count=len(all_alerts),
+                rule_alert_count=len(rule_alerts),
+                ml_alert_count=len(ml_alerts),
+                protocol_stats_json=json.dumps(proto_counts, ensure_ascii=False),
             )
-            db.session.add(alert)
+            db.session.add(scan)
+            db.session.flush()
 
-        db.session.commit()
-        result["scan_id"] = scan.id
-        # ────────────────────────────────────────────────────────────
+            for a in all_alerts:
+                alert = Alert(
+                    scan_id=scan.id,
+                    timestamp=str(a.get("timestamp", "")),
+                    type=a.get("type", ""),
+                    severity=a.get("severity", ""),
+                    source_ip=a.get("source_ip", ""),
+                    detail=a.get("detail", ""),
+                )
+                db.session.add(alert)
+
+            db.session.commit()
+            result["scan_id"] = scan.id
+        except Exception as db_err:
+            db.session.rollback()
+            logger.error(f"Database error: {db_err}")
+            raise
+        # 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
         # save JSON
         ts_tag = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -375,8 +509,7 @@ def analyze(pcap_filename):
         return jsonify(result)
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Analysis error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 
@@ -393,9 +526,15 @@ def stats():
         examples:
           application/json: {"status": "ok", "summary": {}, "alert_count": 5}
     """
-    if _state["last_result"] is None:
+    with _state_lock:
+        r = _state["last_result"]
+        demo = _state.get("demo_data")
+        capture_running = _state["capture_running"]
+    if r is None:
+        r = demo
+    if r is None:
         return jsonify({"status": "no_data"})
-    r = _state["last_result"]
+    is_demo = (r is demo and _state["last_result"] is None)
     return jsonify({
         "status": "ok",
         "summary": r["summary"],
@@ -403,7 +542,10 @@ def stats():
         "rule_alert_count": r["rule_alert_count"],
         "ml_alert_count": r["ml_alert_count"],
         "protocol_stats": r["protocol_stats"],
-        "capture_running": _state["capture_running"],
+        "alerts": r.get("alerts", []),
+        "time_series": r.get("time_series", []),
+        "capture_running": capture_running,
+        "is_demo": is_demo,
     })
 
 
@@ -456,7 +598,7 @@ def alerts():
     })
 
 
-# ─── Scan History API ───────────────────────────────────────────────
+# 鈹€鈹€鈹€ Scan History API 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 @app.route("/api/scans")
 def list_scans():
@@ -518,7 +660,7 @@ def get_scan(scan_id):
     })
 
 
-# ─── Config API ────────────────────────────────────────────────────
+# 鈹€鈹€鈹€ Config API 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 @app.route("/api/config", methods=["GET"])
 def get_config():
@@ -541,6 +683,7 @@ def get_config():
 
 
 @app.route("/api/config", methods=["POST"])
+@require_auth
 def set_config():
     """
     Update config.json with validated payload (partial merge)
@@ -607,96 +750,141 @@ def demo_status():
     })
 
 
-# ─── main ────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€ main 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
-if __name__ == "__main__":
+# 鈹€鈹€ Capture progress endpoint 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+@app.route("/api/capture/progress")
+def capture_progress():
+    """
+    Poll capture progress (for frontend progress bar)
+    ---
+    tags:
+      - Capture
+    responses:
+      200:
+        description: Capture progress
+    """
+    with _state_lock:
+        running = _state["capture_running"]
+        started_at = _state["capture_started_at"]
+        total = _state["capture_total"]
+        capture_error = _state.get("capture_error")
+    elapsed = 0
+    if started_at and running:
+        elapsed = int(time.time() - started_at)
+    return jsonify({
+        "running": running,
+        "elapsed": elapsed,
+        "total": total,
+        "percent": min(100, int(elapsed / max(total, 1) * 100)) if running else 0,
+        "capture_error": capture_error,
+    })
+
+
+# 鈹€鈹€ App initialization (DB + demo data) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+_initialized = False
+
+def _init_app():
+    global _initialized
+    if _initialized:
+        return
+    _initialized = True
     with app.app_context():
         db.create_all()
-
-    # ── Demo mode: auto-load sample data ─────────────────────────
     if DEMO_MODE:
-        demo_pcap = os.path.join(BASE_DIR, "samples", "demo.pcap")
-        if os.path.exists(demo_pcap):
-            print("[*] Demo mode enabled — analyzing samples/demo.pcap ...")
+        _load_demo_data()
+
+
+def _load_demo_data():
+    """Load demo pcap and store in _state['demo_data'] and SQLite."""
+    demo_pcap = os.path.join(BASE_DIR, "samples", "demo.pcap")
+    if not os.path.exists(demo_pcap):
+        logger.warning(f"DEMO_MODE=true but {demo_pcap} not found")
+        return
+    logger.info("Demo mode — analyzing samples/demo.pcap ...")
+    try:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        analysis = TrafficSniffer.analyze_pcap(demo_pcap, window_sec=5)
+        proto_counts = analysis["stats"]
+        ts_data = analysis["time_series"]
+        flow = analysis["summary"]
+
+        rule_alerts = detect_all(demo_pcap)
+        fe = FeatureExtractor(window_size=5)
+        X = fe.extract(demo_pcap)
+        feature_names = fe.get_feature_names()
+        ml_alerts = []
+        if X.shape[0] >= 5 and os.path.exists(MODEL_PATH):
+            scores, is_anom = MLAnomalyDetector.predict(X, MODEL_PATH)
+            timestamps = [entry.get("time", "") for entry in ts_data]
+            while len(timestamps) < len(scores):
+                timestamps.append(f"window_{len(timestamps)}")
+            ml_alerts = MLAnomalyDetector.generate_alerts(
+                timestamps, is_anom, scores, X, feature_names)
+
+        all_alerts = rule_alerts + ml_alerts
+        all_alerts.sort(key=lambda a: a.get("timestamp", ""))
+
+        result = {
+            "summary": flow,
+            "protocol_stats": proto_counts,
+            "time_series": ts_data,
+            "alerts": all_alerts,
+            "alert_count": len(all_alerts),
+            "rule_alert_count": len(rule_alerts),
+            "ml_alert_count": len(ml_alerts),
+        }
+        _state["demo_data"] = result
+
+        with app.app_context():
             try:
-                # Ensure asyncio event loop
-                try:
-                    asyncio.get_running_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-
-                analysis = TrafficSniffer.analyze_pcap(demo_pcap, window_sec=5)
-                proto_counts = analysis["stats"]
-                ts_data = analysis["time_series"]
-                flow = analysis["summary"]
-
-                rule_alerts = detect_all(demo_pcap)
-                fe = FeatureExtractor(window_size=5)
-                X = fe.extract(demo_pcap)
-                feature_names = fe.get_feature_names()
-                ml_alerts = []
-                if X.shape[0] >= 5 and os.path.exists(MODEL_PATH):
-                    scores, is_anom = MLAnomalyDetector.predict(X, MODEL_PATH)
-                    timestamps = [entry.get("time", "") for entry in ts_data]
-                    while len(timestamps) < len(scores):
-                        timestamps.append(f"window_{len(timestamps)}")
-                    ml_alerts = MLAnomalyDetector.generate_alerts(
-                        timestamps, is_anom, scores, X, feature_names)
-
-                all_alerts = rule_alerts + ml_alerts
-                all_alerts.sort(key=lambda a: a.get("timestamp", ""))
-
-                result = {
-                    "summary": flow,
-                    "protocol_stats": proto_counts,
-                    "time_series": ts_data,
-                    "alerts": all_alerts,
-                    "alert_count": len(all_alerts),
-                    "rule_alert_count": len(rule_alerts),
-                    "ml_alert_count": len(ml_alerts),
-                }
-                _state["last_result"] = result
-
-                with app.app_context():
-                    scan = ScanRecord(
-                        total_packets=flow.get("total_packets", 0),
-                        total_bytes=flow.get("total_bytes", 0),
-                        duration=flow.get("duration", 0),
-                        alert_count=len(all_alerts),
-                        rule_alert_count=len(rule_alerts),
-                        ml_alert_count=len(ml_alerts),
-                        protocol_stats_json=json.dumps(proto_counts, ensure_ascii=False),
+                scan = ScanRecord(
+                    total_packets=flow.get("total_packets", 0),
+                    total_bytes=flow.get("total_bytes", 0),
+                    duration=flow.get("duration", 0),
+                    alert_count=len(all_alerts),
+                    rule_alert_count=len(rule_alerts),
+                    ml_alert_count=len(ml_alerts),
+                    protocol_stats_json=json.dumps(proto_counts, ensure_ascii=False),
+                )
+                db.session.add(scan)
+                db.session.flush()
+                for a in all_alerts:
+                    alert = Alert(
+                        scan_id=scan.id,
+                        timestamp=str(a.get("timestamp", "")),
+                        type=a.get("type", ""),
+                        severity=a.get("severity", ""),
+                        source_ip=a.get("source_ip", ""),
+                        detail=a.get("detail", ""),
                     )
-                    db.session.add(scan)
-                    db.session.flush()
-                    for a in all_alerts:
-                        alert = Alert(
-                            scan_id=scan.id,
-                            timestamp=str(a.get("timestamp", "")),
-                            type=a.get("type", ""),
-                            severity=a.get("severity", ""),
-                            source_ip=a.get("source_ip", ""),
-                            detail=a.get("detail", ""),
-                        )
-                        db.session.add(alert)
-                    db.session.commit()
-                    result["scan_id"] = scan.id
+                    db.session.add(alert)
+                db.session.commit()
+                result["scan_id"] = scan.id
+            except Exception as db_err:
+                db.session.rollback()
+                logger.error(f"Demo DB error: {db_err}")
+                raise
 
-                # Save demo result JSON
-                os.makedirs(RESULTS_DIR, exist_ok=True)
-                demo_json = os.path.join(RESULTS_DIR, "demo_result.json")
-                with open(demo_json, "w", encoding="utf-8") as f:
-                    json.dump(result, f, indent=2, ensure_ascii=False, default=str)
+        os.makedirs(RESULTS_DIR, exist_ok=True)
+        demo_json = os.path.join(RESULTS_DIR, "demo_result.json")
+        with open(demo_json, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False, default=str)
 
-                print(f"[*] Demo mode enabled. Demo data loaded. ({len(all_alerts)} alerts, scan_id={scan.id})")
-            except Exception as e:
-                print(f"[!] Demo data load failed: {e}")
-        else:
-            print(f"[!] DEMO_MODE=true but {demo_pcap} not found")
+        logger.info(f"Demo data loaded. ({len(all_alerts)} alerts, scan_id={scan.id})")
+    except Exception as e:
+        logger.error(f"Demo data load failed: {e}", exc_info=True)
 
+
+if __name__ == "__main__":
+    _init_app()
     mode_tag = " [DEMO]" if DEMO_MODE else ""
-    print(f"[*] ThreatSight API starting on port 5000{mode_tag}")
-    print(f"[*] SQLite database: {DB_PATH}")
-    print(f"[*] Swagger UI: http://localhost:5000/apidocs")
+    logger.info(f"ThreatSight API starting on port 5000{mode_tag}")
+    logger.info(f"SQLite database: {DB_PATH}")
+    logger.info(f"Swagger UI: http://localhost:5000/apidocs")
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
